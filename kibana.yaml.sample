@@ -1,0 +1,4 @@
+kibana:
+  url: '<the-url>'
+  username: '<the-username>'
+  password: '<the-password>'
