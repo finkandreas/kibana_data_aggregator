@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import datetime
 from enum import Enum
+import json
 import logging
 from typing import Any, cast, Dict, List, Optional, Tuple, TypedDict
 
@@ -17,10 +18,15 @@ class ElasticHit(TypedDict):
 
 class Cluster(Enum):
     # completely randomized naming scheme for data in Elastic
-    Daint    = 'alps-daint'
-    Clariden = 'clariden'
-    Santis   = 'alps-santis'
-    Eiger    = 'eiger'
+    Daint     = 'alps-daint'
+    Clariden  = 'clariden'
+    Santis    = 'alps-santis'
+    Eiger     = 'eiger'
+    EigerAlps = 'alps-eiger'
+
+class Filesystem(Enum):
+    Capstor  = "capstor"
+    Iopsstor = "IOPSSTOR"
 
 @dataclass
 class Node:
@@ -83,8 +89,44 @@ class GPUTemeraturepData(object):
                 sorted_data = sorted(temperatureByGpu[gpu_idx], key=lambda dtval: dtval[0])
                 self._temperature_data[nid].append(([ x[0] for x in sorted_data ], [ x[1] for x in sorted_data ] ))
 
-    def getTemperatureData(self, nid: str, gpu_index: int) -> Tuple[List[datetime.datetime], List[float]]:
-        return self._temperature_data[nid][gpu_index]
+    def getTemperatureData(self, node: Node, gpu_index: int) -> Tuple[List[datetime.datetime], List[float]]:
+        return self._temperature_data[node.nid][gpu_index]
+
+class FilesystemStats(object):
+    def __init__(self, data: List[ElasticHit]):
+        # timestamps are all the same
+        self._timestamps_mdops = [ _to_local_datetime(x['_source']['@timestamp']) for x in data ]
+        self._timestamps_readbw = self._timestamps_mdops
+        self._timestamps_readops = self._timestamps_mdops
+        self._timestamps_writebw = self._timestamps_mdops
+        self._timestamps_writeops = self._timestamps_mdops
+        self._md_ops = [ x['_source']['md_ops'] for x in data ]
+        self._read_bw = [ x['_source']['read_bw'] for x in data ]
+        self._read_ops = [ x['_source']['read_ops'] for x in data ]
+        self._write_bw = [ x['_source']['write_bw'] for x in data ]
+        self._write_ops = [ x['_source']['write_ops'] for x in data ]
+
+    def _fillGlobalMetadata(self, data: List[ElasticHit]) -> None:
+        self._timestamps_mdops = [ _to_local_datetime(x['_source']['@timestamp']) for x in data ]
+        self._md_ops = [ x['_source']['totops'] for x in data ]
+    def _fillGlobalRead(self, data: List[ElasticHit]) -> None:
+        self._timestamps_readbw = [ _to_local_datetime(x['_source']['@timestamp']) for x in data ]
+        self._read_bw = [ x['_source']['read_bytes'] for x in data ]
+    def _fillGlobalWrite(self, data: List[ElasticHit]) -> None:
+        self._timestamps_writebw = [ _to_local_datetime(x['_source']['@timestamp']) for x in data ]
+        self._write_bw = [ x['_source']['write_bytes'] for x in data ]
+
+
+    def getMetadataOperations(self) -> Tuple[List[datetime.datetime], List[float]]:
+        return (self._timestamps_mdops, self._md_ops)
+    def getReadBandwidth(self) -> Tuple[List[datetime.datetime], List[float]]:
+        return (self._timestamps_readbw, self._read_bw)
+    def getWriteBandwidth(self) -> Tuple[List[datetime.datetime], List[float]]:
+        return (self._timestamps_writebw, self._write_bw)
+    def getReadOperations(self) -> Tuple[List[datetime.datetime], List[float]]:
+        return (self._timestamps_readops, self._read_ops)
+    def getWriteOperations(self) -> Tuple[List[datetime.datetime], List[float]]:
+        return (self._timestamps_writeops, self._write_ops)
 
 
 class DataCrawler(object):
@@ -127,6 +169,52 @@ class DataCrawler(object):
             stderr_path=full_job.get('std_err', ''),
             full_reply=full_job,
         )
+
+    # returns a list of slurm jobs in a data range
+    def getSlurmJobs(self, cluster: Cluster, start: datetime.datetime, end: datetime.datetime) -> List[SlurmJob]:
+        query = {
+            "bool": {
+                "must": [
+                    {"term":{"cluster":cluster.value}},
+                ],
+                "filter": [{
+                    "range": {
+                        "@timestamp": {
+                            "format": "epoch_second",
+                            "gte": int(start.timestamp()),
+                            "lt": int(end.timestamp()),
+                        }
+                    }
+                }],
+            },
+        }
+        all_results = self._crawl('.ds-logs-slurm.accounting-*', query)
+
+        ret = []
+        for hit in all_results:
+            full_job = hit['_source']
+            if 'script' not in full_job:
+                logger.error(f'Job with id={full_job["jobid"]} has no script associated with it')
+                full_job['script'] = ''
+            ret.append(SlurmJob(
+                jobid=full_job['jobid'],
+                name=full_job['job_name'],
+                cluster=cluster,
+                nodes=self._toNodeObject(expand_nodes(full_job['nodes'] or ''), _to_local_datetime(full_job['@start']), False),
+                start=_to_local_datetime(full_job['@start']),
+                end=_to_local_datetime(full_job['@end']),
+                queued_sec=full_job['@queue_wait'],
+                runtime_sec=full_job['elapsed'],
+                username=full_job['username'],
+                account=full_job['account'],
+                exit_code=full_job['exit_code'],
+                state=full_job['state'],
+                script=full_job['script'],
+                stdout_path=full_job.get('std_out', ''),
+                stderr_path=full_job.get('std_err', ''),
+                full_reply=full_job,
+            ))
+        return ret
 
     def _toNodeObject(self, nodes: List[str], from_dt: datetime.datetime, fillNodeXname: bool) -> List[Node]:
         ret = [Node(nid=x) for x in nodes]
@@ -172,8 +260,8 @@ class DataCrawler(object):
             "bool": {
                 "must":[
                     {"terms":{"nid": [x.nid.replace('nid','').lstrip('0') for x in nodes]}},
-                    {"match":{"Sensor.PhysicalContext": "GPU"}},
-                    {"match":{"MessageId":"CrayTelemetry.Temperature"}},
+                    {"term":{"Sensor.PhysicalContext": "GPU"}},
+                    {"term":{"MessageId":"CrayTelemetry.Temperature"}},
                 ],
                 "filter": [{
                     "range": {
@@ -188,6 +276,94 @@ class DataCrawler(object):
         }
         all_gpu_temp_data = self._crawl('.ds-metrics-facility.telemetry-alps*', query)
         return GPUTemeraturepData(all_gpu_temp_data)
+
+    def getFilesystemJobStats(self, cluster: Cluster, filesystem: Filesystem, job_id: int, from_dt: datetime.datetime, to_dt: datetime.datetime) -> FilesystemStats:
+        query = {
+            "bool": {
+                "must":[
+                    {"term":{"job_id": job_id}},
+                    {"term":{"cluster": cluster.value}},
+                    {"term":{"filesystem": filesystem.value}},
+                ],
+                "filter": [{
+                    "range": {
+                        "@timestamp": {
+                            "format": "epoch_second",
+                            "gte": int(from_dt.timestamp()),
+                            "lt": int(to_dt.timestamp()),
+                        }
+                    }
+                }]
+            }
+        }
+        all_fs_data = self._crawl('.ds-metrics-legacy.telemetry-lustre*', query)
+        return FilesystemStats(all_fs_data)
+
+    def getFilesystemGlobalStats(self, filesystem: Filesystem, from_dt: datetime.datetime, to_dt: datetime.datetime) -> FilesystemStats:
+        ret = FilesystemStats([])
+
+        query = {
+            "bool": {
+                "must":[
+                    {"term":{"type": 'LUSTRE-MDT'}},
+                    {"term":{"System": filesystem.value.upper()}}, # system is ALL_CAPS
+                    {"exists": {"field": "totops"}},
+                ],
+                "filter": [{
+                    "range": {
+                        "@timestamp": {
+                            "format": "epoch_second",
+                            "gte": int(from_dt.timestamp()),
+                            "lt": int(to_dt.timestamp()),
+                        }
+                    }
+                }]
+            }
+        }
+        all_metadata = self._crawl('.ds-metrics-legacy.telemetry-clusterstor*', query)
+        ret._fillGlobalMetadata(all_metadata)
+
+        query = {
+            "bool": {
+                "must":[
+                    {"term":{"System": filesystem.value.upper()}}, # system is ALL_CAPS
+                    {"exists": {"field": "read_bytes"}},
+                ],
+                "filter": [{
+                    "range": {
+                        "@timestamp": {
+                            "format": "epoch_second",
+                            "gte": int(from_dt.timestamp()),
+                            "lt": int(to_dt.timestamp()),
+                        }
+                    }
+                }]
+            }
+        }
+        all_reads = self._crawl('.ds-metrics-legacy.telemetry-clusterstor*', query)
+        ret._fillGlobalRead(all_reads)
+
+        query = {
+            "bool": {
+                "must":[
+                    {"term":{"System": filesystem.value.upper()}}, # system is ALL_CAPS
+                    {"exists": {"field": "read_bytes"}},
+                ],
+                "filter": [{
+                    "range": {
+                        "@timestamp": {
+                            "format": "epoch_second",
+                            "gte": int(from_dt.timestamp()),
+                            "lt": int(to_dt.timestamp()),
+                        }
+                    }
+                }]
+            }
+        }
+        all_reads = self._crawl('.ds-metrics-legacy.telemetry-clusterstor*', query)
+        ret._fillGlobalRead(all_reads)
+
+
 
     def _crawl(self, index: str, query: Dict[str, Any], limit: int=-1) -> List[ElasticHit]:
         all_hits = []
